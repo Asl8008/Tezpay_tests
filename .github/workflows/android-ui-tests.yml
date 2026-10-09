@@ -1,0 +1,153 @@
+name: Android UI Tests (Appium)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  android-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code with LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Verify APK from Repository
+        run: |
+          echo "=== APK Verification ==="
+          ls -lh app/tezpay-debug.apk
+          file app/tezpay-debug.apk
+          
+          SIZE=$(stat -c%s app/tezpay-debug.apk)
+          echo "APK size: $SIZE bytes ($(($SIZE / 1024 / 1024)) MB)"
+          
+          if [ "$SIZE" -lt 1048576 ]; then
+            echo "ERROR: APK file too small"
+            exit 1
+          fi
+          
+          echo "✓ APK verification passed!"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install Appium
+        run: |
+          npm install -g appium@latest
+          appium driver install uiautomator2@latest
+          appium --version
+          appium driver list
+
+      - name: Prepare APK
+        run: |
+          mkdir -p apk
+          cp app/tezpay-debug.apk apk/app.apk
+          ls -lh apk/app.apk
+
+      - name: Start Appium Server
+        run: |
+          appium server --address 127.0.0.1 --port 4723 --log appium.log --log-level info &
+          
+          for i in {1..15}; do
+            if curl -s http://127.0.0.1:4723/status > /dev/null 2>&1; then
+              echo "✓ Appium started"
+              break
+            fi
+            echo "Waiting... $i/15"
+            sleep 2
+          done
+
+      - name: Create Test Script
+        run: |
+          cat > /tmp/run_tests.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "=== Waiting for emulator ==="
+          adb wait-for-device
+          adb shell 'while [[ -z $(getprop sys.boot_completed) ]]; do sleep 1; done'
+          sleep 10
+          
+          echo "=== Device info ==="
+          adb devices -l
+          
+          echo "=== Installing APK ==="
+          adb install -r -t -g apk/app.apk
+          
+          echo "=== Verify installation ==="
+          adb shell pm list packages | grep tez
+          
+          echo "=== Create screenshots dir ==="
+          mkdir -p screenshots
+          
+          echo "=== Running tests ==="
+          pytest -v --tb=short --html=report.html --self-contained-html
+          EOF
+          
+          chmod +x /tmp/run_tests.sh
+
+      - name: Run Emulator & Tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: default
+          arch: x86_64
+          profile: Nexus 6
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          script: bash /tmp/run_tests.sh
+
+      - name: Upload Test Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: |
+            report.html
+            screenshots/
+
+      - name: Upload Appium Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: appium-logs
+          path: appium.log
+
+      - name: Upload Logcat
+        if: failure()
+        run: adb logcat -d > logcat.txt || true
+
+      - name: Upload Logcat Artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logcat
+          path: logcat.txt
